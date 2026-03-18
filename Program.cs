@@ -57,6 +57,7 @@ class Player
 {
     public string Name;
     private PlayerState CurrentState;
+
     public PlayerStateType State
     {
         get => CurrentState.State;
@@ -99,7 +100,6 @@ class Player
 
     public void Update()
     {
-
         switch (State)
         {
             case PlayerStateType.Windup:
@@ -133,6 +133,14 @@ class Player
     }
 
     public bool IsInvulnerable => State == PlayerStateType.DodgeInvuln;
+
+    public Player Clone()
+    {
+        var p = new Player(Name);
+        p.State = State;
+        p.StateTimer = StateTimer;
+        return p;
+    }
 }
 
 // =======================
@@ -156,7 +164,6 @@ class Server
     public Player PlayerB;
     public int Tick = 0;
 
-    // Buffer inputs keyed by tick
     private Dictionary<int, List<PlayerInput>> inputBuffer = new();
 
     public Server(Player a, Player b)
@@ -196,19 +203,58 @@ class Server
 
     private void ResolveConflicts()
     {
-        // PlayerA hits PlayerB
         if (PlayerA.State == PlayerStateType.Active && !PlayerB.IsInvulnerable && PlayerB.State != PlayerStateType.Hitstun)
         {
             PlayerB.State = PlayerStateType.Hitstun;
-            PlayerB.StateTimer = 6; // 100 ms
+            PlayerB.StateTimer = PlayerState.PlayerStateDurations[PlayerStateType.Hitstun];
         }
 
-        // PlayerB hits PlayerA
         if (PlayerB.State == PlayerStateType.Active && !PlayerA.IsInvulnerable && PlayerA.State != PlayerStateType.Hitstun)
         {
             PlayerA.State = PlayerStateType.Hitstun;
-            PlayerA.StateTimer = 6; // 100 ms
+            PlayerA.StateTimer = PlayerState.PlayerStateDurations[PlayerStateType.Hitstun];
         }
+    }
+}
+
+// =======================
+// CLIENT CLASS
+// =======================
+
+class Client
+{
+    public string Name;
+    public Player PlayerState;
+    public List<PlayerInput> Inputs = new();
+    public Dictionary<int, Player> History = new(); // state per tick
+
+    public Client(string name, Player initialState)
+    {
+        Name = name;
+        PlayerState = initialState;
+    }
+
+    public void AddInput(PlayerInput input)
+    {
+        Inputs.Add(input);
+    }
+
+    // Predict player state for current tick
+    public void Predict(int tick)
+    {
+        var tickInputs = Inputs.FindAll(i => i.Tick == tick);
+        History[tick] = PlayerState.Clone();
+
+        foreach (var input in tickInputs)
+            PlayerState.ApplyInput(input.Command);
+
+        PlayerState.Update();
+    }
+
+    // Placeholder for reconciliation
+    public void Reconcile(Player serverState)
+    {
+        // Will be implemented in Commit 5
     }
 }
 
@@ -226,6 +272,10 @@ class Program
 
         var server = new Server(playerA, playerB);
 
+        // Clone the players to simulate them being apart from what the server sees.
+        var clientA = new Client("PlayerA", playerA.Clone());
+        var clientB = new Client("PlayerB", playerB.Clone());
+
         // Example inputs
         var inputs = new List<PlayerInput>
         {
@@ -233,15 +283,33 @@ class Program
             new PlayerInput { Tick = 4, PlayerName = "PlayerB", Command = InputCommand.Dodge }
         };
 
-        // Send all inputs to server buffer
+        // Send all inputs to server and clients
         foreach (var input in inputs)
+        {
             server.ReceiveInput(input);
+            if (input.PlayerName == clientA.Name)
+                clientA.AddInput(input);
+            if (input.PlayerName == clientB.Name)
+                clientB.AddInput(input);
+
+        }
 
         // Run 30 ticks
         for (int t = 0; t < maxTicks; t++)
         {
+            // Client prediction
+            clientA.Predict(t);
+            clientB.Predict(t);
+
+            // Server update
             server.Step();
-            Console.WriteLine($"Tick {t:00} | PlayerA: {server.PlayerA.State,-15} | PlayerB: {server.PlayerB.State,-15}");
+
+            Console.WriteLine(
+                $"Tick {t:00} | " +
+                $"ClientA={clientA.PlayerState.State,-15} | ClientB={clientB.PlayerState.State,-15} || " +
+                $"ServerA={server.PlayerA.State,-15} | ServerB={server.PlayerB.State,-15}"
+            );
+
             Thread.Sleep(50);
         }
 
