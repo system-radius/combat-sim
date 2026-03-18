@@ -11,9 +11,10 @@ enum PlayerStateType
     Idle,
     Windup,
     Active,
-    Recovery,
+    AtkRecovery,
     DodgeStartup,
     DodgeInvuln,
+    DefRecovery,
     Hitstun
 }
 
@@ -44,9 +45,10 @@ class PlayerState
         { PlayerStateType.Idle, 0 },
         { PlayerStateType.Windup, 12 },       // 200 ms / 60Hz
         { PlayerStateType.Active, 6 },        // 100 ms
-        { PlayerStateType.Recovery, 18 },     // 300 ms
+        { PlayerStateType.AtkRecovery, 18 },     // 300 ms
         { PlayerStateType.DodgeStartup, 3 },  // 50 ms
         { PlayerStateType.DodgeInvuln, 6 },   // 100 ms
+        { PlayerStateType.DefRecovery, 12 },// 200 ms
         { PlayerStateType.Hitstun, 6 }        // 100 ms
     };
 
@@ -97,23 +99,25 @@ class Player
 
     public void Update()
     {
-
         switch (State)
         {
             case PlayerStateType.Windup:
                 if (StateTimer == 0) SetState(PlayerStateType.Active);
                 break;
             case PlayerStateType.Active:
-                if (StateTimer == 0) SetState(PlayerStateType.Recovery);
+                if (StateTimer == 0) SetState(PlayerStateType.AtkRecovery);
                 break;
-            case PlayerStateType.Recovery:
+            case PlayerStateType.AtkRecovery:
                 if (StateTimer == 0) SetState(PlayerStateType.Idle);
                 break;
             case PlayerStateType.DodgeStartup:
                 if (StateTimer == 0) SetState(PlayerStateType.DodgeInvuln);
                 break;
             case PlayerStateType.DodgeInvuln:
-                if (StateTimer == 0) SetState(PlayerStateType.Recovery);
+                if (StateTimer == 0) SetState(PlayerStateType.DefRecovery);
+                break;
+            case PlayerStateType.DefRecovery:
+                if (StateTimer == 0) SetState(PlayerStateType.Idle);
                 break;
             case PlayerStateType.Hitstun:
                 if (StateTimer == 0) SetState(PlayerStateType.Idle);
@@ -208,6 +212,7 @@ class Client
     public Player Self;
     public Player Other;
     public List<PlayerInput> Inputs = new();
+    public List<PlayerInput> OtherInputs = new();
     private Dictionary<int, PlayerState> historySelf = new();
     private Dictionary<int, PlayerState> historyOther = new();
 
@@ -218,22 +223,26 @@ class Client
         Other = new Player(other.Name) { Current = other.Current.Clone() };
     }
 
-    public void AddInput(PlayerInput input) => Inputs.Add(input);
+    public void AddInput(PlayerInput input)
+    {
+        if (input.PlayerName == Self.Name) Inputs.Add(input);
+        else OtherInputs.Add(input);
+    }
 
-    public void Predict()
+    public void Predict(int currentSimulationTick)
     {
         // Save history
-        historySelf[Self.CurrentTimerTick()] = Self.Current.Clone();
-        historyOther[Other.CurrentTimerTick()] = Other.Current.Clone();
+        historySelf[Self.StateTimer] = Self.Current.Clone();
+        historyOther[Other.StateTimer] = Other.Current.Clone();
 
         // Predict own player
-        var ownInputs = Inputs.FindAll(i => i.Tick == Self.CurrentTimerTick());
+        var ownInputs = Inputs.FindAll(i => i.Tick == currentSimulationTick);
         foreach (var input in ownInputs)
             Self.ApplyInput(input.Command);
         Self.Update();
 
-        // Predict other player (deterministic: keep previous state if no input)
-        var otherInputs = Inputs.FindAll(i => i.Tick == Other.CurrentTimerTick());
+        // Predict other player (deterministic)
+        var otherInputs = OtherInputs.FindAll(i => i.Tick == Other.StateTimer);
         foreach (var input in otherInputs)
             Other.ApplyInput(input.Command);
         Other.Update();
@@ -241,29 +250,18 @@ class Client
 
     public void Reconcile(Player authoritativeSelf, Player authoritativeOther)
     {
-        // Reconcile self
         if (Self.State != authoritativeSelf.State)
         {
             Console.WriteLine($"\n[Reconcile] {Name}: Predicted Self={Self.State}, Server={authoritativeSelf.State}");
             Self.Current = authoritativeSelf.Current.Clone();
         }
 
-        // Reconcile other
         if (Other.State != authoritativeOther.State)
         {
             Console.WriteLine($"\n[Reconcile] {Name}: Predicted {Other.Name}={Other.State}, Server={authoritativeOther.State}");
             Other.Current = authoritativeOther.Current.Clone();
         }
     }
-}
-
-// =======================
-// EXTENSIONS
-// =======================
-
-static class PlayerExtensions
-{
-    public static int CurrentTimerTick(this Player p) => p.StateTimer; // can be replaced with Tick if needed
 }
 
 // =======================
@@ -274,6 +272,24 @@ class Program
 {
     static void Main()
     {
+        int maxTicks = 70;
+        var inputs = new List<PlayerInput>
+        {
+            new PlayerInput { Tick = 2, PlayerName = "PlayerA", Command = InputCommand.Attack },
+            new PlayerInput { Tick = 4, PlayerName = "PlayerB", Command = InputCommand.Dodge },
+
+            new PlayerInput { Tick = 30, PlayerName = "PlayerB", Command = InputCommand.Attack },
+            new PlayerInput { Tick = 39, PlayerName = "PlayerA", Command = InputCommand.Dodge }
+        };
+
+        Simulate(inputs, maxTicks);
+
+        Console.WriteLine("\n=== Replay Test ===");
+        Replay(inputs, maxTicks);
+    }
+
+    static void Simulate(List<PlayerInput> inputs, int maxTicks)
+    {
         var playerA = new Player("PlayerA");
         var playerB = new Player("PlayerB");
         var server = new Server(playerA, playerB);
@@ -281,13 +297,6 @@ class Program
         var clientA = new Client("ClientA", playerA, playerB);
         var clientB = new Client("ClientB", playerB, playerA);
 
-        var inputs = new List<PlayerInput>
-        {
-            new PlayerInput { Tick = 2, PlayerName = "PlayerA", Command = InputCommand.Attack },
-            new PlayerInput { Tick = 4, PlayerName = "PlayerB", Command = InputCommand.Dodge }
-        };
-
-        // Send inputs to server and clients
         foreach (var input in inputs)
         {
             server.ReceiveInput(input);
@@ -295,21 +304,40 @@ class Program
             clientB.AddInput(input);
         }
 
-        // Run 30 ticks
-        for (int t = 0; t < 30; t++)
+        for (int t = 0; t < maxTicks; t++)
         {
-            clientA.Predict();
-            clientB.Predict();
+            clientA.Predict(server.Tick);
+            clientB.Predict(server.Tick);
 
             server.Step();
 
             clientA.Reconcile(server.PlayerA, server.PlayerB);
             clientB.Reconcile(server.PlayerB, server.PlayerA);
 
-            Console.WriteLine($"Tick {t:00} | ClientA=Self:{clientA.Self.State,-12} Other:{clientA.Other.State,-12} || ClientB=Self:{clientB.Self.State,-12} Other:{clientB.Other.State,-12} || ServerA={server.PlayerA.State,-12} ServerB={server.PlayerB.State,-12}");
-            Thread.Sleep(50);
+            Console.WriteLine(
+                $"Tick {t:00} | ClientA=Self:{clientA.Self.State,-12} Other:{clientA.Other.State,-12} || " +
+                $"ClientB=Self:{clientB.Self.State,-12} Other:{clientB.Other.State,-12} || " +
+                $"ServerA={server.PlayerA.State,-12} ServerB={server.PlayerB.State,-12}"
+            );
         }
 
-        Console.WriteLine("\n=== Simulation Complete ===");
+    }
+
+    static void Replay(List<PlayerInput> inputs, int maxTicks)
+    {
+        var playerA = new Player("PlayerA");
+        var playerB = new Player("PlayerB");
+        var server = new Server(playerA, playerB);
+
+        foreach (var input in inputs)
+            server.ReceiveInput(input);
+
+        for (int t = 0; t < maxTicks; t++)
+        {
+            server.Step();
+            Console.WriteLine($"Replay Tick {t:00} | ServerA={server.PlayerA.State,-12} ServerB={server.PlayerB.State,-12}");
+        }
+
+        Console.WriteLine("=== Replay Complete ===");
     }
 }
